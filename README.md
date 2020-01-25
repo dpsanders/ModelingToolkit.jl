@@ -14,7 +14,10 @@ nicely with user-defined routines. Together, this is an abstract form of a
 scientific model that is easy for humans to generate but also easy for programs
 to manipulate.
 
-#### Warning: This repository is a work-in-progress
+## Tutorial
+
+For an introductory tutorial to using ModelingToolkit.jl, please checkout
+[ModelingToolkit.jl, An IR and Compiler for Scientific Models](https://tutorials.juliadiffeq.org/html/ode_extras/01-ModelingToolkit.html).
 
 ## Introduction by Examples
 
@@ -43,11 +46,10 @@ eqs = [D(x) ~ σ*(y-x),
 
 Each operation builds an `Operation` type, and thus `eqs` is an array of
 `Operation` and `Variable`s. This holds a tree of the full system that can be
-analyzed by other programs. We can turn this into a `DiffEqSystem` via:
+analyzed by other programs. We can turn this into a `ODESystem` via:
 
 ```julia
-de = DiffEqSystem(eqs,t,[x,y,z],[σ,ρ,β])
-de = DiffEqSystem(eqs)
+de = ODESystem(eqs, t, [x,y,z], [σ,ρ,β])
 ```
 
 where we tell it the variable types and ordering in the first version, or let it
@@ -56,31 +58,79 @@ This can then generate the function. For example, we can see the
 generated code via:
 
 ```julia
-generate_function(de)
+using MacroTools
+myode_oop = generate_function(de)[1] # first one is the out-of-place function
+MacroTools.striplines(myode_oop) # print without line numbers
 
-## Which returns:
-:((##363, u, p, t)->begin
-          let (x, y, z, σ, ρ, β) = (u[1], u[2], u[3], p[1], p[2], p[3])
-              ##363[1] = σ * (y - x)
-              ##363[2] = x * (ρ - z) - y
-              ##363[3] = x * y - β * z
+#=
+:((u, p, t)->begin
+          if u isa Array
+              return @inbounds(begin
+                          let (x, y, z, σ, ρ, β) = (u[1], u[2], u[3], p[1], p[2], p[3])
+                              [σ * (y - x), x * (ρ - z) - y, x * y - β * z]
+                          end
+                      end)
+          else
+              X = @inbounds(begin
+                          let (x, y, z, σ, ρ, β) = (u[1], u[2], u[3], p[1], p[2], p[3])
+                              (σ * (y - x), x * (ρ - z) - y, x * y - β * z)
+                          end
+                      end)
           end
+          T = promote_type(map(typeof, X)...)
+          map(T, X)
+          construct = if u isa ModelingToolkit.StaticArrays.StaticArray
+                  ModelingToolkit.StaticArrays.similar_type(typeof(u), eltype(X))
+              else
+                  x->begin
+                          convert(typeof(u), x)
+                      end
+              end
+          construct(X)
       end)
+=#
+
+myode_iip = generate_function(de)[2] # second one is the in-place function
+MacroTools.striplines(myode_iip) # print without line numbers
+
+#=
+:((var"##MTIIPVar#793", u, p, t)->begin
+          @inbounds begin
+                  @inbounds begin
+                          let (x, y, z, σ, ρ, β) = (u[1], u[2], u[3], p[1], p[2], p[3])
+                              var"##MTIIPVar#793"[1] = σ * (y - x)
+                              var"##MTIIPVar#793"[2] = x * (ρ - z) - y
+                              var"##MTIIPVar#793"[3] = x * y - β * z
+                          end
+                      end
+              end
+          nothing
+      end)
+=#
 ```
 
-and get the generated function via:
+or directly get the generated ODE function via:
 
 ```julia
-f = ODEFunction(de)
+f = ODEFunction(de, [x,y,z], [σ,ρ,β])
 ```
 
-### Example: Nonlinear System
+Here already you can see some advantages of the ModelingToolkit.jl compilation system. As an
+IR to target, this output can compile to multiple different forms, including ones specific
+to static arrays and in-place functions. Forms which automatically parallelize the calculations
+based on internal cost models are a work-in-progress as well. This means DSLs built on top of
+this as a model compiler can write domain-specific languages without having to write complex
+optimized Julia function compilers.
+
+### Example: Nonlinear System with NLsolve.jl
 
 We can also build nonlinear systems. Let's say we wanted to solve for the steady
 state of the previous ODE. This is the nonlinear system defined by where the
 derivatives are zero. We use (unknown) variables for our nonlinear system.
 
 ```julia
+using ModelingToolkit
+
 @variables x y z
 @parameters σ ρ β
 
@@ -88,29 +138,122 @@ derivatives are zero. We use (unknown) variables for our nonlinear system.
 eqs = [0 ~ σ*(y-x),
        0 ~ x*(ρ-z)-y,
        0 ~ x*y - β*z]
-ns = NonlinearSystem(eqs)
-nlsys_func = generate_function(ns)
+ns = NonlinearSystem(eqs, [x,y,z], [σ,ρ,β])
+nlsys_func = generate_function(ns)[2] # second is the inplace version
 ```
 
 which generates:
 
 ```julia
-:((##364, u, p)->begin
-          let (x, z, y, ρ, σ, β) = (u[1], u[2], u[3], p[1], p[2], p[3])
-              ##364[1] = σ * (y - x)
-              ##364[2] = x * (ρ - z) - y
-              ##364[3] = x * y - β * z
-          end
-      end)
+(var"##MTIIPVar#405", u, p)->begin
+        @inbounds begin
+                @inbounds begin
+                        let (x, y, z, σ, ρ, β) = (u[1], u[2], u[3], p[1], p[2], p[3])
+                            var"##MTIIPVar#405"[1] = (*)(σ, (-)(y, x))
+                            var"##MTIIPVar#405"[2] = (-)((*)(x, (-)(ρ, z)), y)
+                            var"##MTIIPVar#405"[3] = (-)((*)(x, y), (*)(β, z))
+                        end
+                    end
+            end
+        nothing
+    end
 ```
 
 We can use this to build a nonlinear function for use with NLsolve.jl:
 
 ```julia
-f = @eval eval(nlsys_func)
-# Make a closure over the parameters for for NLsolve.jl
-f2 = (du,u) -> f(du,u,(10.0,26.0,2.33))
+f = eval(nlsys_func)
+du = zeros(3); u = ones(3)
+f(du,u,(10.0,26.0,2.33))
+du
+
+#=
+3-element Array{Float64,1}:
+  0.0
+ 24.0
+ -1.33
+ =#
 ```
+
+We can similarly ask to generate the in-place Jacobian function:
+
+```julia
+j_func = generate_jacobian(ns)[2] # second is in-place
+j! = eval(j_func)
+```
+
+which gives:
+
+```julia
+:((var"##MTIIPVar#582", u, p)->begin
+          #= C:\Users\accou\.julia\dev\ModelingToolkit\src\utils.jl:70 =#
+          #= C:\Users\accou\.julia\dev\ModelingToolkit\src\utils.jl:71 =#
+          #= C:\Users\accou\.julia\dev\ModelingToolkit\src\utils.jl:71 =# @inbounds begin
+                  #= C:\Users\accou\.julia\dev\ModelingToolkit\src\utils.jl:72 =#
+                  #= C:\Users\accou\.julia\dev\ModelingToolkit\src\utils.jl:53 =# @inbounds begin
+                          #= C:\Users\accou\.julia\dev\ModelingToolkit\src\utils.jl:53 =#
+                          let (x, y, z, σ, ρ, β) = (u[1], u[2], u[3], p[1], p[2], p[3])
+                              var"##MTIIPVar#582"[1] = (*)(σ, -1)
+                              var"##MTIIPVar#582"[2] = (-)(ρ, z)
+                              var"##MTIIPVar#582"[3] = y
+                              var"##MTIIPVar#582"[4] = σ
+                              var"##MTIIPVar#582"[5] = -1
+                              var"##MTIIPVar#582"[6] = x
+                              var"##MTIIPVar#582"[7] = 0
+                              var"##MTIIPVar#582"[8] = (*)(x, -1)
+                              var"##MTIIPVar#582"[9] = (*)(-1, β)
+                          end
+                      end
+              end
+          #= C:\Users\accou\.julia\dev\ModelingToolkit\src\utils.jl:74 =#
+          nothing
+      end)
+```
+
+Now we can call `nlsolve` by enclosing our parameters into the functions:
+
+```julia
+nlsolve((out, x) -> f(out, x, params), (out, x) -> j!(out, x, params), ones(3))
+```
+
+If one would like the generated function to be a Julia function instead of an expression, and allow this
+function to be used from within the same world-age, one simply needs to pass `Val{false}` to tell it to
+generate the function, i.e.:
+
+```julia
+nlsys_func = generate_function(ns, [x,y,z], [σ,ρ,β], Val{false})[2]
+```
+
+which uses GeneralizedGenerated.jl to build a same world-age function on the fly without eval.
+
+### Example: Arrays of variables
+
+Sometimes it is convenient to define arrays of variables to model things like `x₁,…,x₃`.
+The `@variables` and `@parameters` macros support this with the following syntax:
+
+```julia
+julia> @variables x[1:3];
+julia> x
+3-element Array{Operation,1}:
+ x₁()
+ x₂()
+ x₃()
+
+# support for arbitrary ranges and tensors
+julia> @variables y[2:3,1:5:6];
+julia> y
+2×2 Array{Operation,2}:
+    y₂̒₁() y₂̒₆()
+    y₃̒₁() y₃̒₆()
+
+# also works for dependent variables
+julia> @parameters t; @variables z[1:3](t);
+julia> z
+3-element Array{Operation,1}:
+ z₁(t())
+ z₂(t())
+ z₃(t())
+ ```
 
 ## Core Principles
 
@@ -130,7 +273,14 @@ In this section we define the core pieces of the IR and what they mean.
 
 ### Variables
 
-The most fundamental part of the IR is the `Variable`. The `Variable` is the
+The most fundamental part of the IR is the `Variable`. In order to mirror the
+intention of solving for variables and representing function-like parameters,
+we treat each instance of `Variable` as a function which is called on its
+arguments using the natural syntax. Rather than having additional mechanisms
+for handling constant variables and parameters, we simply represent them as
+constant functions.
+
+The `Variable` is the
 context-aware single variable of the IR. Its fields are described as follows:
 
 - `name`: the name of the `Variable`. Note that this is not necessarily
@@ -138,9 +288,42 @@ context-aware single variable of the IR. Its fields are described as follows:
   the core identifier of the `Variable` in the sense of equality.
 - `known`: the main denotation of context, storing whether or not the value of
   the variable is known.
-- `dependents`: the vector of variables on which the current variable
-  is dependent. For example, `u(t,x)` has dependents `[t,x]`. Derivatives thus
-  require this information in order to simplify down.
+
+For example, the following code defines an independent variable `t`, a parameter
+`α`, a function parameter `σ`, a variable `x` which depends on `t`, a variable
+`y` with no dependents, a variable `z` which depends on `t`, `α`, and `x(t)`
+and a parameters `β₁` and `β₂`.
+
+
+```julia
+t = Variable(:t; known = true)()  # independent variables are treated as known
+α = Variable(:α; known = true)()  # parameters are known
+σ = Variable(:σ; known = true)    # left uncalled, since it is used as a function
+w = Variable(:w; known = false)   # unknown, left uncalled
+x = Variable(:x; known = false)(t)  # unknown, depends on `t`
+y = Variable(:y; known = false)()   # unknown, no dependents
+z = Variable(:z; known = false)(t, α, x)  # unknown, multiple arguments
+β₁ = Variable(:β, 1; known = true)() # with index 1
+β₂ = Variable(:β, 2; known = true)() # with index 2
+
+expr = β₁ * x + y^α + σ(3) * (z - t) - β₂ * w(t - 1)
+```
+
+We can rewrite this more concisely using macros. Note the difference between
+including and excluding empty parentheses. When in call format, variables are
+aliased to the given call, allowing implicit use of dependents for convenience.
+
+```julia
+@parameters t α σ(..) β[1:2]
+@variables w(..) x(t) y() z(t, α, x)
+
+expr = β₁* x + y^α + σ(3) * (z - t) - β₂ * w(t - 1)
+```
+
+Note that `@parameters` and `@variables` implicitly add `()` to values that
+are not given a call. The former specifies the values as known, while the
+latter specifies it as unknown. `(..)` signifies that the value should be
+left uncalled.
 
 ### Constants
 
@@ -243,7 +426,7 @@ is accessible via a function-based interface. This means that all macros are
 syntactic sugar in some form. For example, the variable construction:
 
 ```julia
-@parameters t σ ρ β
+@parameters t σ ρ β[1:3]
 @variables x(t) y(t) z(t)
 @derivatives D'~t
 ```
@@ -251,14 +434,14 @@ syntactic sugar in some form. For example, the variable construction:
 is syntactic sugar for:
 
 ```julia
-t = Variable(:t; known = true)
-x = Variable(:x, [t])
-y = Variable(:y, [t])
-z = Variable(:z, [t])
+t = Variable(:t; known = true)()
+σ = Variable(:σ; known = true)()
+ρ = Variable(:ρ; known = true)()
+β = [Variable(:β, i; known = true)() for i in 1:3]
+x = Variable(:x)(t)
+y = Variable(:y)(t)
+z = Variable(:z)(t)
 D = Differential(t)
-σ = Variable(:σ; known = true)
-ρ = Variable(:ρ; known = true)
-β = Variable(:β; known = true)
 ```
 
 ### Intermediate Calculations
@@ -272,8 +455,8 @@ a = y - x
 eqs = [0 ~ σ*a,
        0 ~ x*(ρ-z)-y,
        0 ~ x*y - β*z]
-ns = NonlinearSystem(eqs,[x,y,z],[σ,ρ,β])
-nlsys_func = generate_function(ns)
+ns = NonlinearSystem(eqs, [x,y,z])
+nlsys_func = generate_function(ns, [x,y,z], [σ,ρ,β])
 ```
 
 expands to:

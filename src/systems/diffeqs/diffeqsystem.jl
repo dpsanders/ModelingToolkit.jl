@@ -1,4 +1,4 @@
-export DiffEqSystem, ODEFunction
+export ODESystem, ODEFunction
 
 
 using Base: RefValue
@@ -16,98 +16,267 @@ end
 
 
 struct DiffEq  # dⁿx/dtⁿ = rhs
-    x::Expression
-    t::Variable
+    x::Variable
     n::Int
     rhs::Expression
 end
-function Base.convert(::Type{DiffEq}, eq::Equation)
+function to_diffeq(eq::Equation)
     isintermediate(eq) && throw(ArgumentError("intermediate equation received"))
     (x, t, n) = flatten_differential(eq.lhs)
-    return DiffEq(x, t, n, eq.rhs)
+    (isa(t, Operation) && isa(t.op, Variable) && isempty(t.args)) ||
+        throw(ArgumentError("invalid independent variable $t"))
+    (isa(x, Operation) && isa(x.op, Variable) && length(x.args) == 1 && isequal(first(x.args), t)) ||
+        throw(ArgumentError("invalid dependent variable $x"))
+    return t.op, DiffEq(x.op, n, eq.rhs)
 end
-Base.:(==)(a::DiffEq, b::DiffEq) = isequal((a.x, a.t, a.n, a.rhs), (b.x, b.t, b.n, b.rhs))
-get_args(eq::DiffEq) = Expression[eq.x, eq.t, eq.rhs]
+Base.:(==)(a::DiffEq, b::DiffEq) = isequal((a.x, a.n, a.rhs), (b.x, b.n, b.rhs))
 
-struct DiffEqSystem <: AbstractSystem
+"""
+$(TYPEDEF)
+
+A system of ordinary differential equations.
+
+# Fields
+* `eqs` - The ODEs defining the system.
+
+# Examples
+
+```
+using ModelingToolkit
+
+@parameters t σ ρ β
+@variables x(t) y(t) z(t)
+@derivatives D'~t
+
+eqs = [D(x) ~ σ*(y-x),
+       D(y) ~ x*(ρ-z)-y,
+       D(z) ~ x*y - β*z]
+
+de = ODESystem(eqs)
+```
+"""
+struct ODESystem <: AbstractSystem
+    """The ODEs defining the system."""
     eqs::Vector{DiffEq}
+    """Independent variable."""
     iv::Variable
+    """Dependent (state) variables."""
     dvs::Vector{Variable}
+    """Parameter variables."""
     ps::Vector{Variable}
+    """
+    Jacobian matrix. Note: this field will not be defined until
+    [`calculate_jacobian`](@ref) is called on the system.
+    """
     jac::RefValue{Matrix{Expression}}
-    function DiffEqSystem(eqs, iv, dvs, ps)
-        jac = RefValue(Matrix{Expression}(undef, 0, 0))
-        new(eqs, iv, dvs, ps, jac)
-    end
+    """
+    Wfact matrix. Note: this field will not be defined until
+    [`generate_factorized_W`](@ref) is called on the system.
+    """
+    Wfact::RefValue{Matrix{Expression}}
+    """
+    Wfact_t matrix. Note: this field will not be defined until
+    [`generate_factorized_W`](@ref) is called on the system.
+    """
+    Wfact_t::RefValue{Matrix{Expression}}
 end
 
-function DiffEqSystem(eqs)
-    dvs, = extract_elements(eqs, [_is_dependent])
-    ivs = unique(vcat((dv.dependents for dv ∈ dvs)...))
+function ODESystem(eqs)
+    reformatted = to_diffeq.(eqs)
+
+    ivs = unique(r[1] for r ∈ reformatted)
     length(ivs) == 1 || throw(ArgumentError("one independent variable currently supported"))
     iv = first(ivs)
-    ps, = extract_elements(eqs, [_is_parameter(iv)])
-    DiffEqSystem(eqs, iv, dvs, ps)
+
+    deqs = [r[2] for r ∈ reformatted]
+
+    dvs = unique(deq.x for deq ∈ deqs)
+    ps = filter(vars(deq.rhs for deq ∈ deqs)) do x
+        x.known & !isequal(x, iv)
+    end |> collect
+
+    ODESystem(deqs, iv, dvs, ps)
 end
 
-function DiffEqSystem(eqs, iv)
-    dvs, ps = extract_elements(eqs, [_is_dependent, _is_parameter(iv)])
-    DiffEqSystem(eqs, iv, dvs, ps)
+function ODESystem(deqs::AbstractVector{DiffEq}, iv, dvs, ps)
+    jac = RefValue(Matrix{Expression}(undef, 0, 0))
+    Wfact   = RefValue(Matrix{Expression}(undef, 0, 0))
+    Wfact_t = RefValue(Matrix{Expression}(undef, 0, 0))
+    ODESystem(deqs, iv, dvs, ps, jac, Wfact, Wfact_t)
 end
 
+function ODESystem(deqs::AbstractVector{<:Equation}, iv, dvs, ps)
+    _dvs = [deq.op for deq ∈ dvs]
+    _iv = iv.op
+    _ps = [p.op for p ∈ ps]
+    ODESystem(getindex.(to_diffeq.(deqs),2), _iv, _dvs, _ps)
+end
 
-function calculate_jacobian(sys::DiffEqSystem)
+function _eq_unordered(a, b)
+    length(a) === length(b) || return false
+    n = length(a)
+    idxs = Set(1:n)
+    for x ∈ a
+        idx = findfirst(isequal(x), b)
+        idx === nothing && return false
+        idx ∈ idxs      || return false
+        delete!(idxs, idx)
+    end
+    return true
+end
+Base.:(==)(sys1::ODESystem, sys2::ODESystem) =
+    _eq_unordered(sys1.eqs, sys2.eqs) && isequal(sys1.iv, sys2.iv) &&
+    _eq_unordered(sys1.dvs, sys2.dvs) && _eq_unordered(sys1.ps, sys2.ps)
+# NOTE: equality does not check cached Jacobian
+
+independent_variables(sys::ODESystem) = Set{Variable}([sys.iv])
+dependent_variables(sys::ODESystem) = Set{Variable}(sys.dvs)
+parameters(sys::ODESystem) = Set{Variable}(sys.ps)
+
+
+function calculate_jacobian(sys::ODESystem)
     isempty(sys.jac[]) || return sys.jac[]  # use cached Jacobian, if possible
-    rhs = [eq.rhs for eq in sys.eqs]
+    rhs = [eq.rhs for eq ∈ sys.eqs]
 
-    jac = expand_derivatives.(calculate_jacobian(rhs, sys.dvs))
+    iv = sys.iv()
+    dvs = [dv(iv) for dv ∈ sys.dvs]
+
+    jac = expand_derivatives.(calculate_jacobian(rhs, dvs))
     sys.jac[] = jac  # cache Jacobian
     return jac
 end
 
-function generate_jacobian(sys::DiffEqSystem; version::FunctionVersion = ArrayFunction)
+struct ODEToExpr
+    sys::ODESystem
+end
+function (f::ODEToExpr)(O::Operation)
+    if isa(O.op, Variable)
+        isequal(O.op, f.sys.iv) && return O.op.name  # independent variable
+        O.op ∈ f.sys.dvs        && return O.op.name  # dependent variables
+        isempty(O.args)         && return O.op.name  # 0-ary parameters
+        return build_expr(:call, Any[O.op.name; f.(O.args)])
+    end
+    return build_expr(:call, Any[Symbol(O.op); f.(O.args)])
+end
+(f::ODEToExpr)(x) = convert(Expr, x)
+
+function generate_jacobian(sys::ODESystem, dvs = sys.dvs, ps = sys.ps, expression = Val{true}; kwargs...)
     jac = calculate_jacobian(sys)
-    return build_function(jac, sys.dvs, sys.ps, (sys.iv.name,); version = version)
+    return build_function(jac, dvs, ps, (sys.iv.name,), ODEToExpr(sys), expression; kwargs...)
 end
 
-function generate_function(sys::DiffEqSystem; version::FunctionVersion = ArrayFunction)
-    rhss = [eq.rhs for eq ∈ sys.eqs]
-    return build_function(rhss, sys.dvs, sys.ps, (sys.iv.name,); version = version)
+function generate_function(sys::ODESystem, dvs = sys.dvs, ps = sys.ps, expression = Val{true}; kwargs...)
+    rhss = [deq.rhs for deq ∈ sys.eqs]
+    dvs′ = [clean(dv) for dv ∈ dvs]
+    ps′ = [clean(p) for p ∈ ps]
+    return build_function(rhss, dvs′, ps′, (sys.iv.name,), ODEToExpr(sys), expression; kwargs...)
 end
 
+function calculate_factorized_W(sys::ODESystem, simplify=true)
+    isempty(sys.Wfact[]) || return (sys.Wfact[],sys.Wfact_t[])
 
-function generate_ode_iW(sys::DiffEqSystem, simplify=true; version::FunctionVersion = ArrayFunction)
     jac = calculate_jacobian(sys)
+    gam = Variable(:gam; known = true)()
 
-    gam = Variable(:gam; known = true)
-
-    W = LinearAlgebra.I - gam*jac
-    W = SMatrix{size(W,1),size(W,2)}(W)
-    iW = inv(W)
+    W = - LinearAlgebra.I + gam*jac
+    Wfact = lu(W, Val(false), check=false).factors
 
     if simplify
-        iW = simplify_constants.(iW)
+        Wfact = simplify_constants.(Wfact)
     end
 
-    W = inv(LinearAlgebra.I/gam - jac)
-    W = SMatrix{size(W,1),size(W,2)}(W)
-    iW_t = inv(W)
+    W_t = - LinearAlgebra.I/gam + jac
+    Wfact_t = lu(W_t, Val(false), check=false).factors
     if simplify
-        iW_t = simplify_constants.(iW_t)
+        Wfact_t = simplify_constants.(Wfact_t)
     end
+    sys.Wfact[] = Wfact
+    sys.Wfact_t[] = Wfact_t
 
-    vs, ps = sys.dvs, sys.ps
-    iW_func   = build_function(iW  , vs, ps, (:gam,:t); version = version)
-    iW_t_func = build_function(iW_t, vs, ps, (:gam,:t); version = version)
-
-    return (iW_func, iW_t_func)
+    (Wfact,Wfact_t)
 end
 
-function DiffEqBase.ODEFunction(sys::DiffEqSystem; version::FunctionVersion = ArrayFunction)
-    expr = generate_function(sys; version = version)
-    if version === ArrayFunction
-        ODEFunction{true}(eval(expr))
-    elseif version === SArrayFunction
-        ODEFunction{false}(eval(expr))
+function generate_factorized_W(sys::ODESystem, vs = sys.dvs, ps = sys.ps, simplify=true, expression = Val{true}; kwargs...)
+    (Wfact,Wfact_t) = calculate_factorized_W(sys,simplify)
+    siz = size(Wfact)
+    constructor = :(x -> begin
+                        A = SMatrix{$siz...}(x)
+                        StaticArrays.LU(LowerTriangular( SMatrix{$siz...}(UnitLowerTriangular(A)) ), UpperTriangular(A), SVector(ntuple(n->n, max($siz...))))
+                    end)
+
+    Wfact_func   = build_function(Wfact  , vs, ps, (:gam,:t), ODEToExpr(sys), expression;constructor=constructor,kwargs...)
+    Wfact_t_func = build_function(Wfact_t, vs, ps, (:gam,:t), ODEToExpr(sys), expression;constructor=constructor,kwargs...)
+
+    return (Wfact_func, Wfact_t_func)
+end
+
+"""
+$(SIGNATURES)
+
+Create an `ODEFunction` from the [`ODESystem`](@ref). The arguments `dvs` and `ps`
+are used to set the order of the dependent variable and parameter vectors,
+respectively.
+"""
+function DiffEqBase.ODEFunction{iip}(sys::ODESystem, dvs = sys.dvs, ps = sys.ps;
+                                     version = nothing,
+                                     jac = false, Wfact = false) where {iip}
+    f_oop,f_iip = generate_function(sys, dvs, ps, Val{false})
+
+    f(u,p,t) = f_oop(u,p,t)
+    f(du,u,p,t) = f_iip(du,u,p,t)
+
+    if jac
+        jac_oop,jac_iip = generate_jacobian(sys, dvs, ps, Val{false})
+        _jac(u,p,t) = jac_oop(u,p,t)
+        _jac(J,u,p,t) = jac_iip(J,u,p,t)
+    else
+        _jac = nothing
     end
+
+    if Wfact
+        tmp_Wfact,tmp_Wfact_t = generate_factorized_W(sys, dvs, ps, true, Val{false})
+        Wfact_oop, Wfact_iip = tmp_Wfact
+        Wfact_oop_t, Wfact_iip_t = tmp_Wfact_t
+        _Wfact(u,p,dtgamma,t) = Wfact_oop(u,p,dtgamma,t)
+        _Wfact(W,u,p,dtgamma,t) = Wfact_iip(W,u,p,dtgamma,t)
+        _Wfact_t(u,p,dtgamma,t) = Wfact_oop_t(u,p,dtgamma,t)
+        _Wfact_t(W,u,p,dtgamma,t) = Wfact_iip_t(W,u,p,dtgamma,t)
+    else
+        _Wfact,_Wfact_t = nothing,nothing
+    end
+
+    ODEFunction{iip}(f,jac=_jac,
+                      Wfact = _Wfact,
+                      Wfact_t = _Wfact_t,
+                      syms = string.(sys.dvs))
+end
+
+function DiffEqBase.ODEFunction(sys::ODESystem, args...; kwargs...)
+    ODEFunction{true}(sys, args...; kwargs...)
+end
+
+"""
+$(SIGNATURES)
+
+Generate `ODESystem`, dependent variables, and parameters from an `ODEProblem`.
+"""
+function modelingtoolkitize(prob::DiffEqBase.ODEProblem)
+    @parameters t
+    vars = [Variable(:x, i)(t) for i in eachindex(prob.u0)]
+    params = [Variable(:α,i; known = true)() for i in eachindex(prob.p)]
+    @derivatives D'~t
+
+    rhs = [D(var) for var in vars]
+
+    if DiffEqBase.isinplace(prob)
+        lhs = similar(vars, Any)
+        prob.f(lhs, vars, params, t)
+    else
+        lhs = prob.f(vars, params, t)
+    end
+
+    eqs = vcat([rhs[i] ~ lhs[i] for i in eachindex(prob.u0)]...)
+    de = ODESystem(eqs)
+
+    de, vars, params
 end
